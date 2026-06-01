@@ -130,3 +130,154 @@ jobs:
           git add .
           git commit -m "Deploy: Core Engine → sha-${{ github.sha }}" || echo "No changes"
           git push origin main
+name: TaskMind Hardened CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: \( {{ github.workflow }}- \){{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-and-quality:
+    name: Security & Quality Gates
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Monorepo Dependencies
+        run: npm ci
+
+      - name: Compile Protobuf Contracts & Build
+        run: npm run build
+
+      - name: Execute Test Suite
+        run: npm test
+
+      - name: Run Security Vulnerability Audit
+        run: npm audit --audit-level=high
+
+  build-and-push:
+    needs: security-and-quality
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Google Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: us-central1-docker.pkg.dev/taskmind-prod/core/engine
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+
+      - name: Build & Push Hardened Distroless Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./production.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  gitops-deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout Configuration Repo
+        uses: actions/checkout@v4
+        with:
+          repository: 'taskmind/gitops-infrastructure'
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: Update Target Image Hash in Kustomize
+        working-directory: gitops/environments/production
+        run: |
+          kustomize edit set image us-central1-docker.pkg.dev/taskmind-prod/core/engine=us-central1-docker.pkg.dev/taskmind-prod/core/engine:sha-${{ github.sha }}
+
+      - name: Commit and Push Manifest Changes
+        working-directory: gitops
+        run: |
+          git config --global user.name "TaskMind CI Bot"
+          git config --global user.email "ci-bot@taskmind.ai"
+          git add .
+          git commit -m "Automated Deployment: Core Engine Update to sha-${{ github.sha }}" || echo "No changes to commit"
+          git push origin main- name: Setup OPA
+        uses: open-policy-agent/setup-opa@v1
+        with:
+          version: latest
+
+      - name: Validate Policies (Rego syntax & tests)
+        run: |
+          opa check policies/
+          opa test policies/ --verbose
+
+      - name: Enforce Dockerfile & Build Policies
+        run: |
+          opa eval --data policies/ --input production.Dockerfile --format pretty 'data.docker.security.violations'
+
+      - name: Enforce Kustomize Manifest Policies (GitOps)
+        run: |
+          # Render Kustomize and evaluate
+          kustomize build gitops/environments/production > rendered.yaml
+          opa eval --data policies/ --input rendered.yaml --format pretty 'data.kubernetes.admission.deny'package docker.security
+
+deny[msg] {
+    input[i].Cmd == "from"
+    val := split(input[i].Value[0], ":")
+    val[1] == "latest"
+    msg := "Base image must not use 'latest' tag"
+}
+
+deny[msg] {
+    input[i].Cmd == "from"
+    not startswith(input[i].Value[0], "us-central1-docker.pkg.dev/taskmind-prod/")
+    msg := sprintf("Image from unapproved registry: %s", [input[i].Value[0]])
+}package kubernetes.admission
+
+default deny = []
+
+deny[msg] {
+    input.kind == "Deployment"
+    container := input.spec.template.spec.containers[_]
+    container.securityContext.privileged == true
+    msg := "Privileged containers are prohibited"
+}
