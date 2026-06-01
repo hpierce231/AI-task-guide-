@@ -1,1 +1,132 @@
+name: TaskMind Hardened CI/CD Pipeline
 
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: \( {{ github.workflow }}- \){{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-and-quality:
+    name: "Security & Quality Gates"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install deps (monorepo)
+        run: npm ci
+
+      - name: Build + Protobuf
+        run: npm run build
+
+      - name: Run Tests (Node + ESS + Graph)
+        run: npm test
+
+      - name: npm Audit (fuck supply chain attacks)
+        run: npm audit --audit-level=high
+
+      - name: SAST - Semgrep (aggressive mode)
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: auto
+
+      - name: Trivy FS Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+  # ==================== BUILD ====================
+  build-and-push:
+    needs: security-and-quality
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production   # ← Important for approvals + secrets
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # For proper OIDC
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GAR (OIDC preferred)
+        uses: docker/login-action@v3
+        with:
+          registry: us-central1-docker.pkg.dev
+          username: _json_key
+          password: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Extract Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: us-central1-docker.pkg.dev/taskmind-prod/core/engine
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest
+            type=raw,value={{date 'YYYYMMDD'}}-{{sha}}
+
+      - name: Build & Push Distroless (with SBOM)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./production.Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+  # ==================== DEPLOY ====================
+  gitops-deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout GitOps Repo
+        uses: actions/checkout@v4
+        with:
+          repository: 'taskmind/gitops-infrastructure'
+          token: ${{ secrets.GITOPS_PAT }}
+          path: gitops
+
+      - name: Update Kustomize Image
+        working-directory: gitops/environments/production
+        run: |
+          kustomize edit set image us-central1-docker.pkg.dev/taskmind-prod/core/engine=us-central1-docker.pkg.dev/taskmind-prod/core/engine:sha-${{ github.sha }}
+
+      - name: Commit & Push
+        working-directory: gitops
+        run: |
+          git config user.name "TaskMind CI Bot"
+          git config user.email "ci-bot@taskmind.ai"
+          git add .
+          git commit -m "Deploy: Core Engine → sha-${{ github.sha }}" || echo "No changes"
+          git push origin main
